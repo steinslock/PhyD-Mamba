@@ -1,0 +1,5 @@
+__pycache__/
+debug/outputs/
+debug_full/outputs/
+stage1/face_sdk/
+logs/

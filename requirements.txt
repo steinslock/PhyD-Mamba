@@ -1,0 +1,13 @@
+numpy
+pillow
+scipy
+scikit-image
+opencv-python-headless
+matplotlib
+tqdm
+tensorboard
+pyyaml
+requests
+timm>=0.9
+transformers>=4.37
+einops
