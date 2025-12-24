@@ -25,7 +25,7 @@ class Stage3Config:
 
     d_model: int = 128
     num_parts: int = 5
-    num_layers: int = 2
+    num_layers: int = 1
     num_heads: int = 4
     dropout: float = 0.1
     mamba_d_state: int = 16

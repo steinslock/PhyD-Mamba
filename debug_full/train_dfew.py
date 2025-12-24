@@ -132,41 +132,61 @@ try:
 except Exception:
     pass
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DFEW training with Stage3 SATM head.")
     parser.add_argument("--dataset_root", type=str, default="/data/home/cqm/Project/Dataset/DFEW")
     parser.add_argument("--fold", type=int, default=1, help="DFEW fold id (1-5).")
     parser.add_argument("--output_root", type=str, default="/data/home/cqm/Project/Code/Ours/debug_full/outputs/dfew")
-    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--min_lr", type=float, default=5e-6)
-    parser.add_argument("--warmup_lr", type=float, default=0.0)
     parser.add_argument("--weight_decay", type=float, default=0.05)
-    parser.add_argument("--warmup_epochs", type=int, default=20)
     parser.add_argument("--num_frames", type=int, default=16)
     parser.add_argument("--image_size", type=int, default=224)
 
+#-----------------------------Loss 权重--------------------------------------#
     parser.add_argument("--lambda_proto", type=float, default=None, help="Legacy weight for L_con + L_dev (unused by default).")
-    parser.add_argument("--lambda_con", type=float, default=0.02, help="Weight for Stage2 L_con.")
-    parser.add_argument("--lambda_dev", type=float, default=0.05, help="Weight for Stage2 L_dev.")
-    parser.add_argument("--lambda_trs_target", type=float, default=0.01, help="Target weight for Stage3 TRS loss.")
-  
+    parser.add_argument("--lambda_con", type=float, default=0.02, help="Target Weight for Stage2 L_con.")
+    parser.add_argument("--lambda_dev", type=float, default=0.05, help="Target Weight for Stage2 L_dev.")
+    parser.add_argument("--lambda_trs", type=float, default=0.01, help="Target Weight for Stage3 TRS loss.")
+
+#---------------------------warmup 相关参数------------------------------------#
+    parser.add_argument("--warmup_lr", type=float, default=0.0)
+    parser.add_argument("--warmup_epochs", type=int, default=3)
+    parser.add_argument("--lambda_dev_delay_epochs", type=float, default=0.0, help="Epochs after LR warmup to start L_dev warmup.在LR预热完毕后延迟多少个epoch启动。")
+    parser.add_argument("--lambda_con_delay_epochs", type=float, default=2.0, help="Epochs after LR warmup to start L_con warmup.")
+    parser.add_argument("--lambda_trs_delay_epochs", type=float, default=6.0, help="Epochs after LR warmup to start L_trs warmup.")
+    parser.add_argument("--lambda_dev_ramp_epochs", type=float, default=3.0, help="Ramp length for L_dev warmup in epochs.一共花费多少个epoch达到最大。")
+    parser.add_argument("--lambda_con_ramp_epochs", type=float, default=4.0, help="Ramp length for L_con warmup in epochs.")
+    parser.add_argument("--lambda_trs_ramp_epochs", type=float, default=10.0, help="Ramp length for L_trs warmup in epochs.")
+
     parser.add_argument("--compute_trs", action="store_true", default=True, help="Enable Stage3 TRS loss/metrics.")
     parser.add_argument("--no_trs", dest="compute_trs", action="store_false", help="Disable Stage3 TRS computation.")
     parser.add_argument("--stage3_log_interval", type=int, default=50, help="Steps between Stage3 TB logging.")
     parser.add_argument("--stage3_zero_tol", type=float, default=1e-6, help="Tolerance for zero-masked outputs.")
     parser.add_argument("--assert_stage3_zero", action="store_true", default=False, help="Assert Stage3 masked outputs stay near zero.")
     parser.add_argument("--stage3_pca_batches", type=int, default=3, help="Val batches to sample for PCA logging.")
-    parser.add_argument("--warmup_steps_trs", type=int, default=1000, help="Warmup steps for lambda_trs.")
-    parser.add_argument("--pool", type=str, default="mean", choices=["mean", "attn"])
+    parser.add_argument(
+        "--pool",
+        type=str,
+        default="attn",
+        choices=["mean", "attn"],
+        help="Pooling head: attn(default part-attn), mean(legacy mean pooling).",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use_amp", action="store_true", default=True)
     parser.add_argument("--no_amp", action="store_false", dest="use_amp")
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_every", type=int, default=10)
+
+#----------------早停相关参数--------------------#
+    parser.add_argument("--early_stop", action="store_true", default=True, help="Enable early stopping on val UAR.")
+    parser.add_argument("--early_stop_min_epochs", type=int, default=20, help="Enable early stopping after N epochs.")
+    parser.add_argument("--early_stop_patience", type=int, default=10, help="Epochs without improvement to stop.")
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.001, help="Min UAR improvement to reset patience.")
+    
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--probe_ids", type=str, default="00001,00002,00003")
     parser.add_argument("--gpu_ids", type=str, default="0,1", help="comma separated GPU ids")
@@ -281,13 +301,29 @@ def main_worker(local_rank: int, gpu_ids: list[int], args: argparse.Namespace) -
         if logger is not None:
             logger.writer.add_text("hparams/lambda_dev", str(args.lambda_dev))
             logger.writer.add_text("hparams/lambda_con", str(args.lambda_con))
-            logger.writer.add_text("hparams/lambda_trs_target", str(args.lambda_trs_target))
+            logger.writer.add_text("hparams/lambda_trs", str(args.lambda_trs))
+            logger.writer.add_text("hparams/lambda_dev_delay_epochs", str(args.lambda_dev_delay_epochs))
+            logger.writer.add_text("hparams/lambda_con_delay_epochs", str(args.lambda_con_delay_epochs))
+            logger.writer.add_text("hparams/lambda_trs_delay_epochs", str(args.lambda_trs_delay_epochs))
+            logger.writer.add_text("hparams/lambda_dev_ramp_epochs", str(args.lambda_dev_ramp_epochs))
+            logger.writer.add_text("hparams/lambda_con_ramp_epochs", str(args.lambda_con_ramp_epochs))
+            logger.writer.add_text("hparams/lambda_trs_ramp_epochs", str(args.lambda_trs_ramp_epochs))
             logger.writer.add_text("hparams/compute_trs", str(args.compute_trs))
             logger.writer.add_text("hparams/stage3_log_interval", str(args.stage3_log_interval))
+            logger.writer.add_text("hparams/early_stop", str(args.early_stop))
+            logger.writer.add_text("hparams/early_stop_min_epochs", str(args.early_stop_min_epochs))
+            logger.writer.add_text("hparams/early_stop_patience", str(args.early_stop_patience))
+            logger.writer.add_text("hparams/early_stop_min_delta", str(args.early_stop_min_delta))
             logger.dump_text(
                 f"[hparams] lambda_con={args.lambda_con} lambda_dev={args.lambda_dev} "
-                f"lambda_trs_target={args.lambda_trs_target} compute_trs={args.compute_trs} "
-                f"warmup_steps_trs={args.warmup_steps_trs}"
+                f"lambda_trs={args.lambda_trs} "
+                f"dev_delay={args.lambda_dev_delay_epochs} con_delay={args.lambda_con_delay_epochs} "
+                f"trs_delay={args.lambda_trs_delay_epochs} "
+                f"dev_ramp={args.lambda_dev_ramp_epochs} con_ramp={args.lambda_con_ramp_epochs} "
+                f"trs_ramp={args.lambda_trs_ramp_epochs} compute_trs={args.compute_trs} "
+                f"early_stop={args.early_stop} min_epochs={args.early_stop_min_epochs} "
+                f"patience={args.early_stop_patience} "
+                f"min_delta={args.early_stop_min_delta}"
             )
 
     stage1_cfg = Stage1Config(device=str(device), output_global_feats=True)
@@ -328,16 +364,14 @@ def main_worker(local_rank: int, gpu_ids: list[int], args: argparse.Namespace) -
         overfit_n=args.overfit_n,
     )
 
-    num_steps = int(args.epochs * len(train_loader))
-    warmup_steps = int(args.warmup_epochs * len(train_loader))
     scheduler = CosineLRScheduler(
         optimizer,
-        t_initial=num_steps,
+        t_initial=args.epochs,
         lr_min=args.min_lr,
         warmup_lr_init=args.warmup_lr,
-        warmup_t=warmup_steps,
+        warmup_t=args.warmup_epochs,
         cycle_limit=1,
-        t_in_epochs=False,
+        t_in_epochs=True,
     )
     try:
         scaler = amp.GradScaler(enabled=args.use_amp and device.type == "cuda")
@@ -347,6 +381,7 @@ def main_worker(local_rank: int, gpu_ids: list[int], args: argparse.Namespace) -
     start_epoch = 0
     global_step = 0
     best_uar = 0.0
+    early_stop_counter = 0
     if args.resume is not None and os.path.isfile(args.resume):
         checkpoint = torch.load(args.resume, map_location=device)
         if isinstance(model, torch.nn.parallel.DistributedDataParallel):
@@ -359,12 +394,13 @@ def main_worker(local_rank: int, gpu_ids: list[int], args: argparse.Namespace) -
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         best_uar = float(checkpoint.get("best_uar", 0.0))
         global_step = int(checkpoint.get("global_step", 0))
+        early_stop_counter = int(checkpoint.get("early_stop_counter", 0))
         if logger is not None:
             logger.dump_text(f"Resumed from {args.resume} at epoch {start_epoch}")
 
     lambda_con = args.lambda_con if args.overfit_n <= 0 else 0.0
     lambda_dev = args.lambda_dev if args.overfit_n <= 0 else 0.0
-    lambda_trs_target = args.lambda_trs_target if args.overfit_n <= 0 else 0.0
+    lambda_trs = args.lambda_trs if args.overfit_n <= 0 else 0.0
     compute_trs_flag = args.compute_trs and args.overfit_n <= 0
 
     for epoch in range(start_epoch, args.epochs):
@@ -398,7 +434,7 @@ def main_worker(local_rank: int, gpu_ids: list[int], args: argparse.Namespace) -
             logger=logger,
             lambda_con=lambda_con,
             lambda_dev=lambda_dev,
-            lambda_trs_target=lambda_trs_target,
+            lambda_trs=lambda_trs,
             scaler=scaler,
             use_amp=args.use_amp,
             log_interval=args.log_interval,
@@ -415,7 +451,13 @@ def main_worker(local_rank: int, gpu_ids: list[int], args: argparse.Namespace) -
             compute_trs=compute_trs_flag,
             stage3_zero_tol=args.stage3_zero_tol,
             assert_zero_missing=args.assert_stage3_zero,
-            warmup_steps_trs=args.warmup_steps_trs,
+            warmup_epochs_lr=args.warmup_epochs,
+            lambda_dev_delay_epochs=args.lambda_dev_delay_epochs,
+            lambda_con_delay_epochs=args.lambda_con_delay_epochs,
+            lambda_trs_delay_epochs=args.lambda_trs_delay_epochs,
+            lambda_dev_ramp_epochs=args.lambda_dev_ramp_epochs,
+            lambda_con_ramp_epochs=args.lambda_con_ramp_epochs,
+            lambda_trs_ramp_epochs=args.lambda_trs_ramp_epochs,
             start_global_step=global_step,
         )
         global_step = train_metrics.get("global_step", global_step)
@@ -449,7 +491,7 @@ def main_worker(local_rank: int, gpu_ids: list[int], args: argparse.Namespace) -
             logger=logger,
             lambda_con=lambda_con,
             lambda_dev=lambda_dev,
-            lambda_trs_target=lambda_trs_target,
+            lambda_trs=lambda_trs,
             stage1_monitor=val_s1,
             stage2_monitor=val_s2,
             num_classes=7,
@@ -463,7 +505,13 @@ def main_worker(local_rank: int, gpu_ids: list[int], args: argparse.Namespace) -
             stage3_zero_tol=args.stage3_zero_tol,
             assert_zero_missing=args.assert_stage3_zero,
             stage3_pca_batches=args.stage3_pca_batches,
-            warmup_steps_trs=args.warmup_steps_trs,
+            warmup_epochs_lr=args.warmup_epochs,
+            lambda_dev_delay_epochs=args.lambda_dev_delay_epochs,
+            lambda_con_delay_epochs=args.lambda_con_delay_epochs,
+            lambda_trs_delay_epochs=args.lambda_trs_delay_epochs,
+            lambda_dev_ramp_epochs=args.lambda_dev_ramp_epochs,
+            lambda_con_ramp_epochs=args.lambda_con_ramp_epochs,
+            lambda_trs_ramp_epochs=args.lambda_trs_ramp_epochs,
             global_step=global_step,
         )
         if val_s1 is not None:
@@ -471,11 +519,17 @@ def main_worker(local_rank: int, gpu_ids: list[int], args: argparse.Namespace) -
         if val_s2 is not None:
             val_s2.summarize(epoch, split="val")
 
-        if logger is not None:
-            current_uar = float(val_metrics["full"]["uar"])
-            is_best = current_uar > best_uar
-            best_uar = max(best_uar, current_uar)
+        current_uar = float(val_metrics["full"]["uar"])
+        early_stop_active = args.early_stop and (epoch + 1) >= args.early_stop_min_epochs
+        delta = args.early_stop_min_delta if early_stop_active else 0.0
+        is_best = current_uar > (best_uar + delta)
+        if is_best:
+            best_uar = current_uar
+            early_stop_counter = 0
+        elif early_stop_active:
+            early_stop_counter += 1
 
+        if logger is not None:
             state = {
                 "epoch": epoch,
                 "model": model.module.state_dict() if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model.state_dict(),
@@ -484,6 +538,7 @@ def main_worker(local_rank: int, gpu_ids: list[int], args: argparse.Namespace) -
                 "scaler": scaler.state_dict(),
                 "best_uar": best_uar,
                 "global_step": global_step,
+                "early_stop_counter": early_stop_counter,
             }
             torch.save(state, checkpoints_dir / "last.pt")
             if is_best:
@@ -491,6 +546,23 @@ def main_worker(local_rank: int, gpu_ids: list[int], args: argparse.Namespace) -
 
             if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
                 torch.save(state, checkpoints_dir / f"epoch_{epoch+1}.pt")
+
+            if args.early_stop:
+                logger.log_scalar("early_stop/bad_epochs", float(early_stop_counter), epoch)
+                logger.log_scalar("early_stop/best_uar", float(best_uar), epoch)
+
+        if early_stop_active and early_stop_counter >= args.early_stop_patience:
+            if logger is not None:
+                logger.dump_text(
+                    f"Early stopping at epoch {epoch} (best_uar={best_uar:.4f}, "
+                    f"patience={args.early_stop_patience})."
+                )
+            if local_rank == 0:
+                print(
+                    f"[EARLY STOP] epoch={epoch} best_uar={best_uar:.4f} "
+                    f"patience={args.early_stop_patience}"
+                )
+            break
 
     if logger is not None:
         logger.close()

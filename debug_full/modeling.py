@@ -54,6 +54,41 @@ class TemporalPoolingHead(nn.Module):
         return {"logits": logits, "pooled": pooled, "attn": attn_weights}
 
 
+class PartAttentionPoolingHead(nn.Module):
+    def __init__(self, num_parts: int, part_dim: int, num_classes: int) -> None:
+        super().__init__()
+        self.num_parts = num_parts
+        self.part_dim = part_dim
+        self.score_fn = nn.Linear(part_dim, 1)
+        self.classifier = nn.Linear(num_parts * part_dim, num_classes)
+
+    def forward(self, feats: torch.Tensor, mask: torch.Tensor) -> Dict[str, torch.Tensor | None]:
+        if feats.dim() == 3:
+            b, t, d = feats.shape
+            if d != self.num_parts * self.part_dim:
+                raise ValueError(
+                    f"Expected fused dim {self.num_parts * self.part_dim}, but got {d}."
+                )
+            feats = feats.view(b, t, self.num_parts, self.part_dim)
+        if feats.dim() != 4:
+            raise ValueError(f"Expected feats shape (B,T,K,C); got {feats.shape}")
+        if mask.shape != feats.shape[:3]:
+            raise ValueError(f"Mask shape {mask.shape} incompatible with feats {feats.shape}")
+
+        x = feats.permute(0, 2, 1, 3)  # (B,K,T,C)
+        m = mask.permute(0, 2, 1).bool()  # (B,K,T)
+        scores = self.score_fn(x).squeeze(-1)  # (B,K,T)
+        neg_inf = torch.finfo(scores.dtype).min
+        scores = scores.masked_fill(~m, neg_inf)
+        valid = m.any(dim=2, keepdim=True)  # (B,K,1)
+        attn = torch.softmax(scores, dim=2)  # (B,K,T)
+        attn = torch.where(valid, attn, torch.zeros_like(attn))
+        pooled = torch.sum(attn.unsqueeze(-1) * x, dim=2)  # (B,K,C)
+        pooled_flat = pooled.reshape(pooled.shape[0], -1)
+        logits = self.classifier(pooled_flat)
+        return {"logits": logits, "pooled": pooled_flat, "attn": attn.permute(0, 2, 1)}
+
+
 def _stack_stage2_mixed(stage2_out: Dict, part_names: Sequence[str]) -> torch.Tensor:
     """Stack per-part mixed deviation into [B,T,K,C]."""
     mixed_parts: List[torch.Tensor] = []
@@ -72,7 +107,7 @@ class Stage3EmotionModel(nn.Module):
         stage1_config: Optional[Stage1Config] = None,
         stage2_config: Optional[Stage2Config] = None,
         stage3_config: Optional[Stage3Config] = None,
-        pool: str = "mean",
+        pool: str = "attn",
         parser: Optional[FaceXZooParserWrapper] = None,
         compute_trs_default: bool = True,
     ) -> None:
@@ -107,7 +142,12 @@ class Stage3EmotionModel(nn.Module):
         self.stage3 = Stage3SATM(self.stage3_config)
 
         self.head_input_dim = self.stage3_config.d_model * self.stage3_config.num_parts
-        self.head = TemporalPoolingHead(self.head_input_dim, num_classes, pool=pool)
+        if pool == "attn":
+            self.head = PartAttentionPoolingHead(self.stage3_config.num_parts, self.stage3_config.d_model, num_classes)
+        elif pool == "mean":
+            self.head = TemporalPoolingHead(self.head_input_dim, num_classes, pool="mean")
+        else:
+            raise ValueError("pool must be 'mean' or 'attn'")
 
         # Variant helpers
         self.nostage2_proj = nn.ModuleList(
@@ -117,6 +157,14 @@ class Stage3EmotionModel(nn.Module):
         self.backbone = backbone
         self._debug_print_done = False
         self.compute_trs_default = compute_trs_default
+
+    def _run_head(self, feats: torch.Tensor, present: torch.Tensor) -> Dict[str, torch.Tensor | None]:
+        if isinstance(self.head, PartAttentionPoolingHead):
+            return self.head(feats, mask=present)
+        if feats.dim() == 4:
+            feats = feats.view(feats.shape[0], feats.shape[1], -1)
+        time_mask = present.any(dim=2)
+        return self.head(feats, mask=time_mask)
 
     def forward_full(
         self,
@@ -135,7 +183,6 @@ class Stage3EmotionModel(nn.Module):
         compute_trs_flag = self.compute_trs_default if compute_trs is None else compute_trs
         stage3_out = self.stage3(d_in, present, compute_trs=compute_trs_flag, return_debug=return_debug)
         h = stage3_out["H"]  # (B,T,K,C)
-        h_flat = h.view(h.shape[0], h.shape[1], -1)
         time_mask = present.any(dim=2)  # (B,T)
 
         if not self._debug_print_done:
@@ -145,14 +192,14 @@ class Stage3EmotionModel(nn.Module):
                 print("[DEBUG] H:", h.shape)
                 print("[DEBUG] time_mask:", time_mask.shape, time_mask.dtype)
                 try:
-                    dbg_out = self.head(h_flat, mask=time_mask)
+                    dbg_out = self._run_head(h, present)
                     print("[DEBUG] logits:", dbg_out["logits"].shape)
                 except Exception as exc:  # noqa: BLE001
                     print("[DEBUG] head call failed:", repr(exc))
                     raise
             self._debug_print_done = True
 
-        head_out = self.head(h_flat, mask=time_mask)
+        head_out = self._run_head(h, present)
         return {
             "logits": head_out["logits"],
             "pooled": head_out["pooled"],
@@ -192,7 +239,7 @@ class Stage3EmotionModel(nn.Module):
             proj_parts.append(proj_part)
         fused = torch.cat(proj_parts, dim=-1)
         time_mask = present.any(dim=2)
-        head_out = self.head(fused, mask=time_mask)
+        head_out = self._run_head(fused, present)
         return {
             "logits": head_out["logits"],
             "pooled": head_out["pooled"],
@@ -223,9 +270,8 @@ class Stage3EmotionModel(nn.Module):
         compute_trs_flag = self.compute_trs_default if compute_trs is None else compute_trs
         stage3_out = self.stage3(d_in, present, compute_trs=compute_trs_flag, return_debug=return_debug)
         h = stage3_out["H"]
-        h_flat = h.view(h.shape[0], h.shape[1], -1)
         time_mask = present.any(dim=2)
-        head_out = self.head(h_flat, mask=time_mask)
+        head_out = self._run_head(h, present)
         return {
             "logits": head_out["logits"],
             "pooled": head_out["pooled"],
@@ -247,7 +293,7 @@ class Stage3EmotionModel(nn.Module):
                 f"nostage3 fused dim {fused.shape[-1]} != head_input_dim {self.head_input_dim}; please align configs."
             )
         time_mask = present.any(dim=2)
-        head_out = self.head(fused, mask=time_mask)
+        head_out = self._run_head(fused, present)
         return {
             "logits": head_out["logits"],
             "pooled": head_out["pooled"],

@@ -177,13 +177,43 @@ def dump_cls_stats(prefix: str, logits: torch.Tensor, labels: torch.Tensor, num_
         print(f"[{prefix}] UAR(recomputed)={uar:.4f}")
 
 
-def compute_lambda_trs(current_step: int, target: float, warmup_steps: int) -> float:
-    """Linear warmup for lambda_trs."""
-    if warmup_steps <= 0:
-        return float(target)
-    if current_step >= warmup_steps:
-        return float(target)
-    return float(target) * float(current_step) / float(warmup_steps)
+def _linear_ramp(current_step: float, start_step: float, ramp_steps: float) -> float:
+    """Linear ramp from 0 to 1 starting at start_step over ramp_steps."""
+    if ramp_steps <= 0:
+        return 1.0 if current_step >= start_step else 0.0
+    progress = (current_step - start_step) / float(ramp_steps)
+    if progress <= 0.0:
+        return 0.0
+    if progress >= 1.0:
+        return 1.0
+    return float(progress)
+
+
+def compute_lambda_schedule(
+    epoch_progress: float,
+    lambda_con_target: float,
+    lambda_dev_target: float,
+    lambda_trs: float,
+    warmup_epochs_lr: float,
+    lambda_dev_delay_epochs: float,
+    lambda_con_delay_epochs: float,
+    lambda_trs_delay_epochs: float,
+    lambda_dev_ramp_epochs: float,
+    lambda_con_ramp_epochs: float,
+    lambda_trs_ramp_epochs: float,
+) -> Tuple[float, float, float]:
+    """Epoch-based warmup for Stage2/Stage3 lambdas after LR warmup."""
+    s_lr = max(float(warmup_epochs_lr), 0.0)
+    dev_delay = max(float(lambda_dev_delay_epochs), 0.0)
+    con_delay = max(float(lambda_con_delay_epochs), 0.0)
+    trs_delay = max(float(lambda_trs_delay_epochs), 0.0)
+    dev_ramp = max(float(lambda_dev_ramp_epochs), 0.0)
+    con_ramp = max(float(lambda_con_ramp_epochs), 0.0)
+    trs_ramp = max(float(lambda_trs_ramp_epochs), 0.0)
+    lambda_dev = float(lambda_dev_target) * _linear_ramp(epoch_progress, s_lr + dev_delay, dev_ramp)
+    lambda_con = float(lambda_con_target) * _linear_ramp(epoch_progress, s_lr + con_delay, con_ramp)
+    lambda_trs_scaled = float(lambda_trs) * _linear_ramp(epoch_progress, s_lr + trs_delay, trs_ramp)
+    return lambda_con, lambda_dev, lambda_trs_scaled
 
 
 def _compute_stage3_stats(
@@ -357,8 +387,9 @@ def _log_stage3_metrics(
 ) -> None:
     if logger is None:
         return
-    logger.log_scalar(f"{split}/stage3/trs_loss", float(metrics["trs_loss"]), step)
+    logger.log_scalar(f"{split}/stage3/trs_loss_raw", float(metrics["trs_loss"]), step)
     if lambda_trs_current is not None:
+        logger.log_scalar(f"{split}/stage3/trs_loss_weighted", float(metrics["trs_loss"]) * float(lambda_trs_current), step)
         logger.log_scalar(f"{split}/stage3/lambda_trs_current", float(lambda_trs_current), step)
     if metrics.get("fb_diff_mean") is not None:
         logger.log_scalar(f"{split}/stage3/forward_backward_diff_mean", float(metrics["fb_diff_mean"]), step)
@@ -387,6 +418,37 @@ def _log_stage3_metrics(
         raise AssertionError(
             f"Stage3 masked output not zero: {metrics['masked_output_abs_max']:.6f} > tol {zero_tol}"
         )
+
+
+def _log_stage3_gates(logger: TrainingLogger | None, model: torch.nn.Module, epoch: int) -> None:
+    if logger is None:
+        return
+    base_model = _unwrap(model)
+    stage3 = getattr(base_model, "stage3", None)
+    blocks = getattr(stage3, "blocks", None) if stage3 is not None else None
+    if blocks is None:
+        return
+    alpha_spatial: List[float] = []
+    alpha_temporal: List[float] = []
+    for block in blocks:
+        if hasattr(block, "alpha_spatial"):
+            alpha_spatial.append(float(block.alpha_spatial.detach().cpu().item()))
+        if hasattr(block, "alpha_temporal"):
+            alpha_temporal.append(float(block.alpha_temporal.detach().cpu().item()))
+    if alpha_spatial:
+        if len(alpha_spatial) == 1:
+            logger.log_scalar("gate/alpha_spatial", alpha_spatial[0], epoch)
+        else:
+            mean_val = sum(alpha_spatial) / len(alpha_spatial)
+            logger.log_scalar("gate/alpha_spatial_mean", float(mean_val), epoch)
+            logger.log_scalar("gate/alpha_spatial_max", float(max(alpha_spatial)), epoch)
+    if alpha_temporal:
+        if len(alpha_temporal) == 1:
+            logger.log_scalar("gate/alpha_temporal", alpha_temporal[0], epoch)
+        else:
+            mean_val = sum(alpha_temporal) / len(alpha_temporal)
+            logger.log_scalar("gate/alpha_temporal_mean", float(mean_val), epoch)
+            logger.log_scalar("gate/alpha_temporal_max", float(max(alpha_temporal)), epoch)
 
 
 class Stage3MetricAggregator:
@@ -529,7 +591,7 @@ def train_one_epoch(
     logger: TrainingLogger | None,
     lambda_con: float,
     lambda_dev: float,
-    lambda_trs_target: float,
+    lambda_trs: float,
     scaler: GradScaler,
     use_amp: bool,
     log_interval: int,
@@ -546,12 +608,19 @@ def train_one_epoch(
     compute_trs: bool = True,
     stage3_zero_tol: float = 1e-6,
     assert_zero_missing: bool = False,
-    warmup_steps_trs: int = 1000,
+    warmup_epochs_lr: float = 0.0,
+    lambda_dev_delay_epochs: float = 1.0,
+    lambda_con_delay_epochs: float = 2.0,
+    lambda_trs_delay_epochs: float = 4.0,
+    lambda_dev_ramp_epochs: float = 2.0,
+    lambda_con_ramp_epochs: float = 2.0,
+    lambda_trs_ramp_epochs: float = 5.0,
     start_global_step: int = 0,
 ) -> Dict[str, float]:
     model.train()
     total_steps = len(dataloader)
     loss_sums = torch.zeros(5, device=device)
+    weighted_sums = torch.zeros(3, device=device)
     cm = torch.zeros((num_classes, num_classes), device=device)
     epoch_logits: List[torch.Tensor] = []
     epoch_labels: List[torch.Tensor] = []
@@ -584,7 +653,20 @@ def train_one_epoch(
         ac_ctx = amp.autocast(device_type="cuda", enabled=use_amp and device.type == "cuda") if device.type == "cuda" else nullcontext()
         with ac_ctx:
             need_debug = logger is not None and (step % stage3_log_interval == 0)
-            lambda_trs = compute_lambda_trs(global_step, lambda_trs_target, warmup_steps_trs)
+            epoch_progress = epoch + (step / max(total_steps, 1))
+            lambda_con_current, lambda_dev_current, lambda_trs_current = compute_lambda_schedule(
+                epoch_progress,
+                lambda_con,
+                lambda_dev,
+                lambda_trs,
+                warmup_epochs_lr,
+                lambda_dev_delay_epochs,
+                lambda_con_delay_epochs,
+                lambda_trs_delay_epochs,
+                lambda_dev_ramp_epochs,
+                lambda_con_ramp_epochs,
+                lambda_trs_ramp_epochs,
+            )
             outputs = model(
                 frames,
                 parsed_labels,
@@ -594,23 +676,29 @@ def train_one_epoch(
             losses = compute_losses(
                 outputs,
                 labels,
-                lambda_con=lambda_con,
-                lambda_dev=lambda_dev,
-                lambda_trs=lambda_trs,
+                lambda_con=lambda_con_current,
+                lambda_dev=lambda_dev_current,
+                lambda_trs=lambda_trs_current,
                 use_aux_losses=use_aux_losses,
                 weights=ce_weights,
             )
+        weighted_l_con = lambda_con_current * losses["l_con"]
+        weighted_l_dev = lambda_dev_current * losses["l_dev"]
+        weighted_l_trs = lambda_trs_current * losses["l_trs"]
         loss_sums[0] += losses["total"]
         loss_sums[1] += losses["task_loss"]
         loss_sums[2] += losses["l_con"]
         loss_sums[3] += losses["l_dev"]
         loss_sums[4] += losses["l_trs"]
+        weighted_sums[0] += weighted_l_con
+        weighted_sums[1] += weighted_l_dev
+        weighted_sums[2] += weighted_l_trs
 
         scaler.scale(losses["total"]).backward()
         scaler.step(optimizer)
         scaler.update()
         if scheduler is not None:
-            scheduler.step_update(global_step)
+            scheduler.step(epoch_progress)
 
         preds = torch.argmax(outputs["logits"], dim=-1)
         _cm_add(cm, preds, labels, num_classes)
@@ -623,13 +711,16 @@ def train_one_epoch(
             stage2_monitor.update(outputs["stage2"], video_ids)
 
         if logger is not None:
-            logger.log_scalar("stage3/lambda_trs_current", lambda_trs, global_step)
+            logger.log_scalar("stage3/lambda_trs_current", lambda_trs_current, global_step)
         if logger is not None and step % log_interval == 0:
             logger.log_scalar("train/loss/total_step", losses["total"].item(), global_step)
             logger.log_scalar("train/loss/task_step", losses["task_loss"].item(), global_step)
-            logger.log_scalar("train/loss/l_con_step", losses["l_con"].item(), global_step)
-            logger.log_scalar("train/loss/l_dev_step", losses["l_dev"].item(), global_step)
-            logger.log_scalar("train/loss/l_trs_step", losses["l_trs"].item(), global_step)
+            logger.log_scalar("train/loss/l_con_raw_step", losses["l_con"].item(), global_step)
+            logger.log_scalar("train/loss/l_con_weighted_step", weighted_l_con.item(), global_step)
+            logger.log_scalar("train/loss/l_dev_raw_step", losses["l_dev"].item(), global_step)
+            logger.log_scalar("train/loss/l_dev_weighted_step", weighted_l_dev.item(), global_step)
+            logger.log_scalar("train/loss/l_trs_raw_step", losses["l_trs"].item(), global_step)
+            logger.log_scalar("train/loss/l_trs_weighted_step", weighted_l_trs.item(), global_step)
             logger.log_scalar("train/lr", _lr_from_optimizer(optimizer), global_step)
 
         if logger is not None and global_step < 1000:
@@ -656,7 +747,7 @@ def train_one_epoch(
                         log_hist=True,
                         zero_tol=stage3_zero_tol,
                         assert_zero=assert_zero_missing,
-                        lambda_trs_current=lambda_trs,
+                        lambda_trs_current=lambda_trs_current,
                     )
 
         if hasattr(iterator, "set_postfix") and step % max(1, log_interval // 2) == 0:
@@ -665,6 +756,7 @@ def train_one_epoch(
     step_tensor = torch.tensor([total_steps], device=device, dtype=torch.float32)
     if distributed:
         dist.all_reduce(loss_sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(weighted_sums, op=dist.ReduceOp.SUM)
         dist.all_reduce(cm, op=dist.ReduceOp.SUM)
         dist.all_reduce(step_tensor, op=dist.ReduceOp.SUM)
 
@@ -677,6 +769,11 @@ def train_one_epoch(
         "l_dev": (loss_sums[3] / total_steps_global).item(),
         "l_trs": (loss_sums[4] / total_steps_global).item(),
     }
+    avg_weighted = {
+        "l_con": (weighted_sums[0] / total_steps_global).item(),
+        "l_dev": (weighted_sums[1] / total_steps_global).item(),
+        "l_trs": (weighted_sums[2] / total_steps_global).item(),
+    }
     metrics = _metrics_from_cm(cm)
     try:
         concat_logits = torch.cat(epoch_logits, dim=0).cpu()
@@ -687,13 +784,17 @@ def train_one_epoch(
     if logger is not None:
         logger.log_scalar("train/loss/total", avg_losses["total"], epoch)
         logger.log_scalar("train/loss/task", avg_losses["task"], epoch)
-        logger.log_scalar("train/loss/l_con", avg_losses["l_con"], epoch)
-        logger.log_scalar("train/loss/l_dev", avg_losses["l_dev"], epoch)
-        logger.log_scalar("train/loss/l_trs", avg_losses["l_trs"], epoch)
+        logger.log_scalar("train/loss/l_con_raw", avg_losses["l_con"], epoch)
+        logger.log_scalar("train/loss/l_con_weighted", avg_weighted["l_con"], epoch)
+        logger.log_scalar("train/loss/l_dev_raw", avg_losses["l_dev"], epoch)
+        logger.log_scalar("train/loss/l_dev_weighted", avg_weighted["l_dev"], epoch)
+        logger.log_scalar("train/loss/l_trs_raw", avg_losses["l_trs"], epoch)
+        logger.log_scalar("train/loss/l_trs_weighted", avg_weighted["l_trs"], epoch)
         logger.log_scalar("train/acc", metrics["acc"], epoch)
         logger.log_scalar("train/uar", metrics["uar"], epoch)
         logger.log_scalar("train/war", metrics["war"], epoch)
         logger.dump_text(f"Epoch {epoch} train time {elapsed:.1f}s acc {metrics['acc']:.4f} uar {metrics['uar']:.4f}")
+        _log_stage3_gates(logger, model, epoch)
 
     return {
         "acc": metrics["acc"],
@@ -717,7 +818,7 @@ def evaluate(
     logger: TrainingLogger | None,
     lambda_con: float,
     lambda_dev: float,
-    lambda_trs_target: float,
+    lambda_trs: float,
     stage1_monitor: Stage1Monitor | None,
     stage2_monitor: Stage2Monitor | None,
     num_classes: int,
@@ -731,11 +832,18 @@ def evaluate(
     stage3_zero_tol: float = 1e-6,
     assert_zero_missing: bool = False,
     stage3_pca_batches: int = 3,
-    warmup_steps_trs: int = 1000,
+    warmup_epochs_lr: float = 0.0,
+    lambda_dev_delay_epochs: float = 1.0,
+    lambda_con_delay_epochs: float = 2.0,
+    lambda_trs_delay_epochs: float = 4.0,
+    lambda_dev_ramp_epochs: float = 2.0,
+    lambda_con_ramp_epochs: float = 2.0,
+    lambda_trs_ramp_epochs: float = 5.0,
     global_step: int = 0,
 ) -> Dict[str, Dict[str, float]]:
     model.eval()
     loss_sums = torch.zeros(5, device=device)
+    weighted_sums = torch.zeros(3, device=device)
     cms = {
         "full": torch.zeros((num_classes, num_classes), device=device),
         "nostage2": torch.zeros((num_classes, num_classes), device=device),
@@ -746,7 +854,20 @@ def evaluate(
     epoch_labels: List[torch.Tensor] = []
     stage3_agg = Stage3MetricAggregator()
     pca_samples: List[Tuple[torch.Tensor, torch.Tensor]] = []
-    lambda_trs_eval = compute_lambda_trs(global_step, lambda_trs_target, warmup_steps_trs)
+    epoch_progress = float(epoch) + 1.0
+    lambda_con_eval, lambda_dev_eval, lambda_trs_eval = compute_lambda_schedule(
+        epoch_progress,
+        lambda_con,
+        lambda_dev,
+        lambda_trs,
+        warmup_epochs_lr,
+        lambda_dev_delay_epochs,
+        lambda_con_delay_epochs,
+        lambda_trs_delay_epochs,
+        lambda_dev_ramp_epochs,
+        lambda_con_ramp_epochs,
+        lambda_trs_ramp_epochs,
+    )
 
     with torch.no_grad():
         iterator = tqdm(
@@ -781,8 +902,8 @@ def evaluate(
             losses = compute_losses(
                 full_out,
                 labels,
-                lambda_con=lambda_con,
-                lambda_dev=lambda_dev,
+                lambda_con=lambda_con_eval,
+                lambda_dev=lambda_dev_eval,
                 lambda_trs=lambda_trs_eval,
                 use_aux_losses=use_aux_losses,
                 weights=ce_weights,
@@ -792,6 +913,9 @@ def evaluate(
             loss_sums[2] += losses["l_con"]
             loss_sums[3] += losses["l_dev"]
             loss_sums[4] += losses["l_trs"]
+            weighted_sums[0] += lambda_con_eval * losses["l_con"]
+            weighted_sums[1] += lambda_dev_eval * losses["l_dev"]
+            weighted_sums[2] += lambda_trs_eval * losses["l_trs"]
 
             for name in cms:
                 preds = torch.argmax(outs[name]["logits"], dim=-1)
@@ -824,6 +948,7 @@ def evaluate(
     step_tensor = torch.tensor([len(dataloader)], device=device, dtype=torch.float32)
     if distributed:
         dist.all_reduce(loss_sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(weighted_sums, op=dist.ReduceOp.SUM)
         dist.all_reduce(step_tensor, op=dist.ReduceOp.SUM)
         for name in cms:
             dist.all_reduce(cms[name], op=dist.ReduceOp.SUM)
@@ -835,6 +960,11 @@ def evaluate(
         "l_con": (loss_sums[2] / total_steps_global).item(),
         "l_dev": (loss_sums[3] / total_steps_global).item(),
         "l_trs": (loss_sums[4] / total_steps_global).item(),
+    }
+    avg_weighted = {
+        "l_con": (weighted_sums[0] / total_steps_global).item(),
+        "l_dev": (weighted_sums[1] / total_steps_global).item(),
+        "l_trs": (weighted_sums[2] / total_steps_global).item(),
     }
     metrics_full = _metrics_from_cm(cms["full"])
     metrics_nostage2 = _metrics_from_cm(cms["nostage2"])
@@ -850,9 +980,12 @@ def evaluate(
     if logger is not None:
         logger.log_scalar("val/loss/total", avg_losses["total"], epoch)
         logger.log_scalar("val/loss/task", avg_losses["task"], epoch)
-        logger.log_scalar("val/loss/l_con", avg_losses["l_con"], epoch)
-        logger.log_scalar("val/loss/l_dev", avg_losses["l_dev"], epoch)
-        logger.log_scalar("val/loss/l_trs", avg_losses["l_trs"], epoch)
+        logger.log_scalar("val/loss/l_con_raw", avg_losses["l_con"], epoch)
+        logger.log_scalar("val/loss/l_con_weighted", avg_weighted["l_con"], epoch)
+        logger.log_scalar("val/loss/l_dev_raw", avg_losses["l_dev"], epoch)
+        logger.log_scalar("val/loss/l_dev_weighted", avg_weighted["l_dev"], epoch)
+        logger.log_scalar("val/loss/l_trs_raw", avg_losses["l_trs"], epoch)
+        logger.log_scalar("val/loss/l_trs_weighted", avg_weighted["l_trs"], epoch)
 
         logger.log_scalar("val/acc", metrics_full["acc"], epoch)
         logger.log_scalar("val/uar", metrics_full["uar"], epoch)
