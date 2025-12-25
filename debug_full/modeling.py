@@ -54,13 +54,67 @@ class TemporalPoolingHead(nn.Module):
         return {"logits": logits, "pooled": pooled, "attn": attn_weights}
 
 
+class EmotionClassifier(nn.Module):
+    def __init__(
+        self,
+        num_instances: int,
+        feature_dim: int,
+        num_classes: int,
+        dropout_rate: float = 0.5,
+        hidden_dim: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.input_dim = num_instances * feature_dim
+        if hidden_dim is None or hidden_dim <= 0:
+            hidden_dim = max(1, self.input_dim // 3)
+        self.hidden_dim = int(hidden_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.input_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(self.hidden_dim, num_classes),
+        )
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 3:
+            raise ValueError(f"Expected x shape (B,K,C); got {x.shape}")
+        x = x.view(x.shape[0], -1)
+        return self.mlp(x)
+
+
 class PartAttentionPoolingHead(nn.Module):
-    def __init__(self, num_parts: int, part_dim: int, num_classes: int) -> None:
+    def __init__(
+        self,
+        num_parts: int,
+        part_dim: int,
+        num_classes: int,
+        classifier_hidden_dim: Optional[int] = None,
+        classifier_dropout: float = 0.5,
+    ) -> None:
         super().__init__()
         self.num_parts = num_parts
         self.part_dim = part_dim
-        self.score_fn = nn.Linear(part_dim, 1)
-        self.classifier = nn.Linear(num_parts * part_dim, num_classes)
+        self.score_fn = nn.Sequential(
+            nn.Linear(part_dim, part_dim),
+            nn.GELU(),
+            nn.Linear(part_dim, 1),
+        )
+        self.classifier = EmotionClassifier(
+            num_parts,
+            part_dim,
+            num_classes,
+            dropout_rate=classifier_dropout,
+            hidden_dim=classifier_hidden_dim,
+        )
 
     def forward(self, feats: torch.Tensor, mask: torch.Tensor) -> Dict[str, torch.Tensor | None]:
         if feats.dim() == 3:
@@ -85,7 +139,7 @@ class PartAttentionPoolingHead(nn.Module):
         attn = torch.where(valid, attn, torch.zeros_like(attn))
         pooled = torch.sum(attn.unsqueeze(-1) * x, dim=2)  # (B,K,C)
         pooled_flat = pooled.reshape(pooled.shape[0], -1)
-        logits = self.classifier(pooled_flat)
+        logits = self.classifier(pooled)
         return {"logits": logits, "pooled": pooled_flat, "attn": attn.permute(0, 2, 1)}
 
 
@@ -110,6 +164,8 @@ class Stage3EmotionModel(nn.Module):
         pool: str = "attn",
         parser: Optional[FaceXZooParserWrapper] = None,
         compute_trs_default: bool = True,
+        classifier_hidden_dim: Optional[int] = None,
+        classifier_dropout: float = 0.5,
     ) -> None:
         super().__init__()
         self.stage1_config = stage1_config or Stage1Config(output_global_feats=True)
@@ -143,7 +199,13 @@ class Stage3EmotionModel(nn.Module):
 
         self.head_input_dim = self.stage3_config.d_model * self.stage3_config.num_parts
         if pool == "attn":
-            self.head = PartAttentionPoolingHead(self.stage3_config.num_parts, self.stage3_config.d_model, num_classes)
+            self.head = PartAttentionPoolingHead(
+                self.stage3_config.num_parts,
+                self.stage3_config.d_model,
+                num_classes,
+                classifier_hidden_dim=classifier_hidden_dim,
+                classifier_dropout=classifier_dropout,
+            )
         elif pool == "mean":
             self.head = TemporalPoolingHead(self.head_input_dim, num_classes, pool="mean")
         else:

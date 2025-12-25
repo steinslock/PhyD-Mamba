@@ -432,9 +432,19 @@ def _log_stage3_gates(logger: TrainingLogger | None, model: torch.nn.Module, epo
     alpha_temporal: List[float] = []
     for block in blocks:
         if hasattr(block, "alpha_spatial"):
-            alpha_spatial.append(float(block.alpha_spatial.detach().cpu().item()))
+            raw_val = float(block.alpha_spatial.detach().cpu().item())
+            cfg = getattr(block, "config", None)
+            max_val = getattr(cfg, "alpha_spatial_max", None)
+            if max_val is not None:
+                raw_val = min(raw_val, float(max_val))
+            alpha_spatial.append(raw_val)
         if hasattr(block, "alpha_temporal"):
-            alpha_temporal.append(float(block.alpha_temporal.detach().cpu().item()))
+            raw_val = float(block.alpha_temporal.detach().cpu().item())
+            cfg = getattr(block, "config", None)
+            max_val = getattr(cfg, "alpha_temporal_max", None)
+            if max_val is not None:
+                raw_val = min(raw_val, float(max_val))
+            alpha_temporal.append(raw_val)
     if alpha_spatial:
         if len(alpha_spatial) == 1:
             logger.log_scalar("gate/alpha_spatial", alpha_spatial[0], epoch)

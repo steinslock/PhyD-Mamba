@@ -20,11 +20,13 @@ class Stage3Config:
         mamba_d_conv: Convolution kernel size inside Mamba.
         mamba_expand: Expansion ratio for Mamba inner dimension.
         trs_eps: Numerical epsilon for TRS masked average.
+        alpha_spatial_max: Upper bound for spatial residual gate.
+        alpha_temporal_max: Upper bound for temporal residual gate.
         part_names: Optional part names; used only for validation/debug.
     """
 
     d_model: int = 128
-    num_parts: int = 5
+    num_parts: int = 6
     num_layers: int = 1
     num_heads: int = 4
     dropout: float = 0.1
@@ -32,6 +34,8 @@ class Stage3Config:
     mamba_d_conv: int = 4
     mamba_expand: int = 2
     trs_eps: float = 1e-6
+    alpha_spatial_max: float = 0.01
+    alpha_temporal_max: float = 0.01
     part_names: Optional[List[str]] = field(default_factory=default_part_names)
 
     def __post_init__(self) -> None:
@@ -45,6 +49,10 @@ class Stage3Config:
             raise ValueError("Mamba parameters must be positive.")
         if self.trs_eps <= 0:
             raise ValueError("trs_eps must be positive.")
+        if self.alpha_spatial_max < 0:
+            raise ValueError("alpha_spatial_max must be non-negative.")
+        if self.alpha_temporal_max < 0:
+            raise ValueError("alpha_temporal_max must be non-negative.")
         if self.part_names is None or len(self.part_names) != self.num_parts:
             raise ValueError(
                 f"part_names length ({len(self.part_names) if self.part_names else 0}) "

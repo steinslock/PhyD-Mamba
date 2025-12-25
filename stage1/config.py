@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 
 @dataclass
@@ -7,7 +7,7 @@ class PartMappingConfig:
     """Mapping from raw parser labels to target facial-part IDs."""
 
     part_names: List[str]
-    raw_to_part: Dict[int, int]
+    raw_to_part: Dict[int, Union[int, Sequence[int]]]
     left_right_pairs: List[Tuple[int, int]] = field(default_factory=list)
 
     def num_parts(self) -> int:
@@ -17,11 +17,13 @@ class PartMappingConfig:
         if not self.part_names:
             raise ValueError("part_names cannot be empty.")
         max_pid = self.num_parts() - 1
-        for raw, pid in self.raw_to_part.items():
-            if pid < 0 or pid > max_pid:
-                raise ValueError(
-                    f"raw label {raw} maps to invalid part id {pid}; expected 0..{max_pid}."
-                )
+        for raw, pid_or_list in self.raw_to_part.items():
+            part_ids = (pid_or_list,) if isinstance(pid_or_list, int) else pid_or_list
+            for pid in part_ids:
+                if pid < 0 or pid > max_pid:
+                    raise ValueError(
+                        f"raw label {raw} maps to invalid part id {pid}; expected 0..{max_pid}."
+                    )
         for left, right in self.left_right_pairs:
             if left < 0 or right < 0 or left > max_pid or right > max_pid:
                 raise ValueError(
@@ -66,14 +68,21 @@ class Stage1Config:
 
 
 def default_part_mapping(include_optional: bool = False) -> PartMappingConfig:
-    """Default mapping focused on five parts using FaceX-Zoo labels.
+    """Default mapping focused on six parts using FaceX-Zoo labels.
 
     FaceX-Zoo parsing labels (from face_parsing_extract.py):
-        0: background, 1: face/skin, 2: right brow, 3: left brow,
-        4: right eye, 5: left eye, 6: nose,
-        7: upper lip, 8: inner mouth, 9: lower lip,
+        0: background
+        1: face/skin
+        2: right brow
+        3: left brow,
+        4: right eye
+        5: left eye
+        6: nose,
+        7: upper lip
+        8: inner mouth
+        9: lower lip,
         10: hair
-    We merge 7/8/9 into a single mouth part.
+    We merge 7/8/9 into a single mouth part and add a full-face part.
     """
 
     part_names = [
@@ -82,15 +91,18 @@ def default_part_mapping(include_optional: bool = False) -> PartMappingConfig:
         "left_eye",    # part 2
         "right_eye",   # part 3
         "mouth",       # part 4
+        "full_face",   # part 5
     ]
     raw_to_part = {
-        3: 0,  # left brow
-        2: 1,  # right brow
-        5: 2,  # left eye
-        4: 3,  # right eye
-        7: 4,  # upper lip
-        8: 4,  # inner mouth
-        9: 4,  # lower lip
+        1: [5],       # face/skin
+        3: [0, 5],    # left brow
+        2: [1, 5],    # right brow
+        5: [2, 5],    # left eye
+        4: [3, 5],    # right eye
+        6: [5],       # nose
+        7: [4, 5],    # upper lip
+        8: [4, 5],    # inner mouth
+        9: [4, 5],    # lower lip
     }
     left_right_pairs = [(0, 1), (2, 3)]
 
@@ -98,14 +110,21 @@ def default_part_mapping(include_optional: bool = False) -> PartMappingConfig:
         # Append optional parts (nose, skin, hair, background)
         base_len = len(part_names)
         part_names.extend(["nose", "skin", "hair", "background"])
-        raw_to_part.update(
-            {
-                6: base_len + 0,  # nose
-                1: base_len + 1,  # skin/face
-                10: base_len + 2,  # hair
-                0: base_len + 3,  # background
-            }
-        )
+        optional_map = {
+            6: base_len + 0,   # nose
+            1: base_len + 1,   # skin/face
+            10: base_len + 2,  # hair
+            0: base_len + 3,   # background
+        }
+        for raw_id, part_id in optional_map.items():
+            if raw_id in raw_to_part:
+                existing = raw_to_part[raw_id]
+                if isinstance(existing, int):
+                    raw_to_part[raw_id] = [existing, part_id]
+                else:
+                    raw_to_part[raw_id] = list(existing) + [part_id]
+            else:
+                raw_to_part[raw_id] = [part_id]
 
     return PartMappingConfig(
         part_names=part_names, raw_to_part=raw_to_part, left_right_pairs=left_right_pairs

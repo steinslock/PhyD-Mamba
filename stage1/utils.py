@@ -1,4 +1,4 @@
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -40,15 +40,18 @@ def normalize_frames(
 
 
 def labels_to_part_masks(
-    labels: torch.Tensor, raw_to_part: Dict[int, int], num_parts: int
+    labels: torch.Tensor, raw_to_part: Dict[int, Union[int, Sequence[int]]], num_parts: int
 ) -> torch.Tensor:
     """Convert raw label map (B,T,H,W) to one-hot masks (B,T,K,H,W)."""
     if labels.dim() != 4:
         raise ValueError(f"labels must have shape (B,T,H,W); got {labels.shape}")
     b, t, h, w = labels.shape
     masks = torch.zeros((b, t, num_parts, h, w), device=labels.device, dtype=torch.float32)
-    for raw_id, part_id in raw_to_part.items():
-        masks[:, :, part_id] += (labels == raw_id).float()
+    for raw_id, part_ids in raw_to_part.items():
+        if isinstance(part_ids, int):
+            part_ids = (part_ids,)
+        for part_id in part_ids:
+            masks[:, :, part_id] += (labels == raw_id).float()
     return masks.clamp_(0.0, 1.0)
 
 

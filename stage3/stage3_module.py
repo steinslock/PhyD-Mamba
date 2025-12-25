@@ -105,7 +105,8 @@ class SATMBlock(nn.Module):
                 )
                 attn_weights[valid_frames] = attn_w_valid
 
-        x_spatial = x_sp + self.alpha_spatial * attn_out
+        alpha = torch.clamp(self.alpha_spatial, max=float(self.config.alpha_spatial_max))
+        x_spatial = x_sp + alpha * attn_out
         return x_spatial.view(b, t, k, c), None if attn_weights is None else attn_weights.view(b, t, k, k)
 
     def _temporal_bimamba(
@@ -124,7 +125,8 @@ class SATMBlock(nn.Module):
         y = y_fwd + y_bwd
         y = y.view(b, k, t, c).permute(0, 2, 1, 3).contiguous()
 
-        h = (x + self.alpha_temporal * y) * mask.unsqueeze(-1)  # output-end masking
+        alpha = torch.clamp(self.alpha_temporal, max=float(self.config.alpha_temporal_max))
+        h = (x + alpha * y) * mask.unsqueeze(-1)  # output-end masking
         if return_y:
             y_fwd_out = y_fwd.view(b, k, t, c).permute(0, 2, 1, 3).contiguous()
             y_bwd_out = y_bwd.view(b, k, t, c).permute(0, 2, 1, 3).contiguous()

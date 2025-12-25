@@ -29,6 +29,8 @@ for p in (PROJECT_ROOT, THIS_DIR):
         sys.path.append(str(p))
 
 from stage1.config import Stage1Config  # noqa: E402
+from stage2.stage2_config import Stage2Config  # noqa: E402
+from stage3.stage3_config import Stage3Config  # noqa: E402
 from engine import build_dataloaders, evaluate, seed_everything, train_one_epoch  # noqa: E402
 from logger import TrainingLogger, ensure_dir  # noqa: E402
 from modeling import Stage3EmotionModel  # noqa: E402
@@ -137,7 +139,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_root", type=str, default="/data/home/cqm/Project/Dataset/DFEW")
     parser.add_argument("--fold", type=int, default=1, help="DFEW fold id (1-5).")
     parser.add_argument("--output_root", type=str, default="/data/home/cqm/Project/Code/Ours/debug_full/outputs/dfew")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-4)
@@ -152,6 +154,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_dev", type=float, default=0.05, help="Target Weight for Stage2 L_dev.")
     parser.add_argument("--lambda_trs", type=float, default=0.01, help="Target Weight for Stage3 TRS loss.")
 
+
+#----------------------------隐藏层和dropout----------------------------------#
+    parser.add_argument("--cls_hidden_dim", type=int, default=64, help="Classifier hidden dim; 0 uses input_dim//3.分类头隐藏层维度。")
+    parser.add_argument("--cls_dropout", type=float, default=0.5, help="Classifier dropout rate.最终分类头dropout比例")
+    parser.add_argument("--stage2_latent_dim", type=int, default=128, help="Stage2 latent dimension (projection size). stage2中将特征维度降低到多少维")
+    parser.add_argument("--stage2_dropout", type=float, default=0.1, help="Stage2 MLP dropout rate.")
+    parser.add_argument("--stage3_dropout", type=float, default=0.1, help="Stage3 spatial attention dropout rate.")
+   
+
+    parser.add_argument("--alpha_temporal_max", type=float, default=0.02, help="Upper bound for Stage3 alpha_temporal.")
+    parser.add_argument("--alpha_spatial_max", type=float, default=0.01, help="Upper bound for Stage3 alpha_spatial.")
+
 #---------------------------warmup 相关参数------------------------------------#
     parser.add_argument("--warmup_lr", type=float, default=0.0)
     parser.add_argument("--warmup_epochs", type=int, default=3)
@@ -159,7 +173,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_con_delay_epochs", type=float, default=2.0, help="Epochs after LR warmup to start L_con warmup.")
     parser.add_argument("--lambda_trs_delay_epochs", type=float, default=6.0, help="Epochs after LR warmup to start L_trs warmup.")
     parser.add_argument("--lambda_dev_ramp_epochs", type=float, default=3.0, help="Ramp length for L_dev warmup in epochs.一共花费多少个epoch达到最大。")
-    parser.add_argument("--lambda_con_ramp_epochs", type=float, default=4.0, help="Ramp length for L_con warmup in epochs.")
+    parser.add_argument("--lambda_con_ramp_epochs", type=float, default=5.0, help="Ramp length for L_con warmup in epochs.")
     parser.add_argument("--lambda_trs_ramp_epochs", type=float, default=10.0, help="Ramp length for L_trs warmup in epochs.")
 
     parser.add_argument("--compute_trs", action="store_true", default=True, help="Enable Stage3 TRS loss/metrics.")
@@ -181,10 +195,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_every", type=int, default=10)
 
-#----------------早停相关参数--------------------#
+#---------------------------早停相关参数--------------------------------------#
     parser.add_argument("--early_stop", action="store_true", default=True, help="Enable early stopping on val UAR.")
-    parser.add_argument("--early_stop_min_epochs", type=int, default=20, help="Enable early stopping after N epochs.")
-    parser.add_argument("--early_stop_patience", type=int, default=10, help="Epochs without improvement to stop.")
+    parser.add_argument("--early_stop_min_epochs", type=int, default=30, help="Enable early stopping after N epochs.")
+    parser.add_argument("--early_stop_patience", type=int, default=20, help="Epochs without improvement to stop.")
     parser.add_argument("--early_stop_min_delta", type=float, default=0.001, help="Min UAR improvement to reset patience.")
     
     parser.add_argument("--resume", type=str, default=None)
@@ -302,6 +316,12 @@ def main_worker(local_rank: int, gpu_ids: list[int], args: argparse.Namespace) -
             logger.writer.add_text("hparams/lambda_dev", str(args.lambda_dev))
             logger.writer.add_text("hparams/lambda_con", str(args.lambda_con))
             logger.writer.add_text("hparams/lambda_trs", str(args.lambda_trs))
+            logger.writer.add_text("hparams/stage2_latent_dim", str(args.stage2_latent_dim))
+            logger.writer.add_text("hparams/cls_hidden_dim", str(args.cls_hidden_dim))
+            logger.writer.add_text("hparams/cls_dropout", str(args.cls_dropout))
+            logger.writer.add_text("hparams/stage2_dropout", str(args.stage2_dropout))
+            logger.writer.add_text("hparams/stage3_dropout", str(args.stage3_dropout))
+            logger.writer.add_text("hparams/alpha_spatial_max", str(args.alpha_spatial_max))
             logger.writer.add_text("hparams/lambda_dev_delay_epochs", str(args.lambda_dev_delay_epochs))
             logger.writer.add_text("hparams/lambda_con_delay_epochs", str(args.lambda_con_delay_epochs))
             logger.writer.add_text("hparams/lambda_trs_delay_epochs", str(args.lambda_trs_delay_epochs))
@@ -316,7 +336,11 @@ def main_worker(local_rank: int, gpu_ids: list[int], args: argparse.Namespace) -
             logger.writer.add_text("hparams/early_stop_min_delta", str(args.early_stop_min_delta))
             logger.dump_text(
                 f"[hparams] lambda_con={args.lambda_con} lambda_dev={args.lambda_dev} "
-                f"lambda_trs={args.lambda_trs} "
+                f"lambda_trs={args.lambda_trs} stage2_latent_dim={args.stage2_latent_dim} "
+                f"cls_hidden_dim={args.cls_hidden_dim} cls_dropout={args.cls_dropout} "
+                f"stage2_dropout={args.stage2_dropout} "
+                f"stage3_dropout={args.stage3_dropout} "
+                f"alpha_spatial_max={args.alpha_spatial_max} "
                 f"dev_delay={args.lambda_dev_delay_epochs} con_delay={args.lambda_con_delay_epochs} "
                 f"trs_delay={args.lambda_trs_delay_epochs} "
                 f"dev_ramp={args.lambda_dev_ramp_epochs} con_ramp={args.lambda_con_ramp_epochs} "
@@ -327,7 +351,26 @@ def main_worker(local_rank: int, gpu_ids: list[int], args: argparse.Namespace) -
             )
 
     stage1_cfg = Stage1Config(device=str(device), output_global_feats=True)
-    model = Stage3EmotionModel(pool=args.pool, stage1_config=stage1_cfg, compute_trs_default=args.compute_trs)
+    stage2_cfg = Stage2Config(
+        latent_dim=args.stage2_latent_dim,
+        dropout_p=args.stage2_dropout,
+    )
+    stage3_cfg = Stage3Config(
+        d_model=args.stage2_latent_dim,
+        num_parts=stage2_cfg.num_parts,
+        dropout=args.stage3_dropout,
+        alpha_spatial_max=args.alpha_spatial_max,
+    )
+    classifier_hidden_dim = None if args.cls_hidden_dim <= 0 else args.cls_hidden_dim
+    model = Stage3EmotionModel(
+        pool=args.pool,
+        stage1_config=stage1_cfg,
+        stage2_config=stage2_cfg,
+        stage3_config=stage3_cfg,
+        compute_trs_default=args.compute_trs,
+        classifier_hidden_dim=classifier_hidden_dim,
+        classifier_dropout=args.cls_dropout,
+    )
     model.to(device)
 
     if distributed:

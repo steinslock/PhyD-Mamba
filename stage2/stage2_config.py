@@ -5,8 +5,8 @@ from typing import List, Optional
 
 
 def default_part_names() -> List[str]:
-    """Default five-part names for facial components."""
-    return ["left_brow", "right_brow", "left_eye", "right_eye", "mouth"]
+    """Default six-part names for facial components."""
+    return ["left_brow", "right_brow", "left_eye", "right_eye", "mouth", "full_face"]
 
 
 @dataclass
@@ -29,7 +29,7 @@ class Stage2Config:
     d_in: int = 768
     latent_dim: int = 128
     hidden_dim: int = 256
-    num_parts: int = 5
+    num_parts: int = 6
     num_prototypes: int = 32
     eps: float = 1e-6
     use_dropout: bool = True
